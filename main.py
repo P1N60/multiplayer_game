@@ -1,7 +1,10 @@
 import argparse
+import ipaddress
 import json
+import os
 import random
 import socket
+import subprocess
 import threading
 import time
 import urllib.error
@@ -31,6 +34,102 @@ MENU_PANEL = (28, 31, 38)
 MENU_TEXT = (235, 235, 235)
 MENU_MUTED = (165, 170, 185)
 MENU_ACCENT = (94, 200, 255)
+
+
+def parse_port_or_default(value: str, default: int = 5000) -> int:
+    try:
+        port = int(value.strip())
+    except ValueError:
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
+def is_global_ipv4(ip_text: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return False
+    return ip.version == 4 and ip.is_global
+
+
+def build_network_help(mode: str, host_value: str, port_value: str, lan_ip: str, public_ip: str):
+    port = parse_port_or_default(port_value)
+    items = []
+
+    if mode == "host":
+        items.append((f"Host bind: 0.0.0.0:{port} (all local interfaces)", MENU_TEXT))
+        items.append((f"Share this with friend: {public_ip}:{port}", MENU_ACCENT))
+
+        if not is_global_ipv4(public_ip):
+            items.append(("Public IP unavailable/non-global. Internet hosting may fail (possible CGNAT).", (255, 150, 150)))
+        else:
+            items.append(("Router: forward UDP port to this PC's LAN IP.", MENU_MUTED))
+
+        items.append((f"Forward UDP {port} -> {lan_ip}:{port} in router settings.", MENU_MUTED))
+        items.append(("Allow inbound UDP on Windows Firewall for this app/port.", MENU_MUTED))
+    else:
+        host = host_value.strip() or "127.0.0.1"
+        items.append((f"Client target: {host}:{port}", MENU_TEXT))
+        if host in {"127.0.0.1", "localhost"}:
+            items.append(("127.0.0.1 only works on your own PC.", (255, 150, 150)))
+        else:
+            items.append(("Use host's public IP for internet, LAN IP for same network.", MENU_MUTED))
+
+    return items
+
+
+def configure_windows_firewall_udp(port: int) -> Tuple[bool, str]:
+    if os.name != "nt":
+        return False, "Auto firewall setup is Windows-only."
+
+    in_rule = f"MultiplayerTopDown UDP {port} In"
+    out_rule = f"MultiplayerTopDown UDP {port} Out"
+
+    def run_netsh(args):
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    try:
+        run_netsh(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={in_rule}"])
+        run_netsh(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={out_rule}"])
+
+        in_result = run_netsh(
+            [
+                "netsh",
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                f"name={in_rule}",
+                "dir=in",
+                "action=allow",
+                "protocol=UDP",
+                f"localport={port}",
+            ]
+        )
+        out_result = run_netsh(
+            [
+                "netsh",
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                f"name={out_rule}",
+                "dir=out",
+                "action=allow",
+                "protocol=UDP",
+                f"localport={port}",
+            ]
+        )
+
+        combined = "\n".join([in_result.stdout, in_result.stderr, out_result.stdout, out_result.stderr]).lower()
+        if in_result.returncode != 0 or out_result.returncode != 0:
+            if "access is denied" in combined:
+                return False, "Firewall setup needs admin rights. Run the game as administrator once."
+            return False, "Firewall rule setup failed. Open UDP port manually in Windows Firewall."
+
+        return True, f"Windows Firewall updated: UDP {port} inbound/outbound allowed."
+    except FileNotFoundError:
+        return False, "netsh not found. Configure firewall manually."
 
 
 @dataclass
@@ -306,6 +405,9 @@ def launch_menu() -> Optional[SimpleNamespace]:
         "port": "Port",
     }
     active_idx = 0
+    show_network_help = True
+    status_message = ""
+    status_until = 0.0
 
     running = True
     while running:
@@ -326,6 +428,13 @@ def launch_menu() -> Optional[SimpleNamespace]:
                     mode = "host"
                 elif event.key == pygame.K_F2:
                     mode = "client"
+                elif event.key == pygame.K_F3:
+                    show_network_help = not show_network_help
+                elif event.key == pygame.K_F5:
+                    port = parse_port_or_default(fields["port"])
+                    ok, message = configure_windows_firewall_udp(port)
+                    status_message = message
+                    status_until = time.time() + 5.0
                 elif event.key in (pygame.K_TAB, pygame.K_DOWN):
                     active_idx = (active_idx + 1) % len(field_order)
                 elif event.key == pygame.K_UP:
@@ -337,13 +446,7 @@ def launch_menu() -> Optional[SimpleNamespace]:
                     name = fields["name"].strip() or "Player"
                     host = (fields["host"].strip() or "127.0.0.1") if mode == "client" else "0.0.0.0"
                     bind_host = "0.0.0.0"
-                    try:
-                        port = int(fields["port"].strip())
-                    except ValueError:
-                        port = 5000
-
-                    if not (1 <= port <= 65535):
-                        port = 5000
+                    port = parse_port_or_default(fields["port"])
 
                     pygame.quit()
                     return SimpleNamespace(mode=mode, name=name, host=host, bind_host=bind_host, port=port)
@@ -389,8 +492,18 @@ def launch_menu() -> Optional[SimpleNamespace]:
 
         _draw_text(screen, tiny_font, f"Your LAN IP: {lan_ip}  |  Public IP: {public_ip}", (190, 530), MENU_MUTED)
         _draw_text(screen, small_font, "Arrows/Tab: Select field   Enter: Start   Esc: Quit", (190, 550), MENU_MUTED)
-        _draw_text(screen, small_font, "In Host mode, Host IP input is ignored and binds to 0.0.0.0", (190, 575), MENU_MUTED)
-        _draw_text(screen, tiny_font, "Internet play needs router UDP port-forward on chosen port (default 5000).", (190, 600), MENU_MUTED)
+        _draw_text(screen, small_font, "F3: Toggle network help   F5: Auto firewall rule (Windows)", (190, 575), MENU_MUTED)
+
+        if show_network_help:
+            help_lines = build_network_help(mode, fields["host"], fields["port"], lan_ip, public_ip)
+            help_y = 600
+            for text, color in help_lines[:2]:
+                _draw_text(screen, tiny_font, text, (190, help_y), color)
+                help_y += 22
+
+        if status_message and time.time() < status_until:
+            status_color = (140, 240, 170) if "updated" in status_message.lower() else (255, 170, 170)
+            _draw_text(screen, tiny_font, status_message, (190, 620), status_color)
 
         pygame.display.flip()
 
